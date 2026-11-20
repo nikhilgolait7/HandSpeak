@@ -1,4 +1,3 @@
-
 require("dotenv").config();
 
 const express = require("express");
@@ -16,6 +15,7 @@ app.use(express.json());
 
 const server = http.createServer(app);
 
+// WebSocket server (for the Caregiver Expo App)
 const wss = new WebSocket.Server({
   noServer: true
 });
@@ -26,7 +26,7 @@ const DEVICE_TOKEN = process.env.DEVICE_TOKEN;
 const CAREGIVER_TOKEN = process.env.CAREGIVER_TOKEN;
 const PATIENT_ID = process.env.PATIENT_ID || "patient-001";
 
-// Connected clients
+// Connected caregiver clients
 const clients = new Map();
 
 // Patient state
@@ -37,53 +37,27 @@ const patientState = {
 };
 
 const REQUESTS = {
-  water: {
-    message: "Patient needs water",
-    priority: "normal"
-  },
-
-  medicine: {
-    message: "Patient needs medicine",
-    priority: "high"
-  },
-
-  food: {
-    message: "Patient needs food",
-    priority: "normal"
-  },
-
-  help: {
-    message: "Patient needs help",
-    priority: "high"
-  },
-
-  emergency: {
-    message: "Patient requires emergency assistance",
-    priority: "critical"
-  }
+  water: { message: "Patient needs water", priority: "normal" },
+  medicine: { message: "Patient needs medicine", priority: "high" },
+  food: { message: "Patient needs food", priority: "normal" },
+  help: { message: "Patient needs help", priority: "high" },
+  emergency: { message: "Patient requires emergency assistance", priority: "critical" }
 };
 
-// ---------------- BROADCAST ----------------
-
+// ---------------- BROADCAST TO CAREGIVER APP ----------------
 function broadcast(data, target = "caregiver") {
-
   const payload = JSON.stringify(data);
-
   for (const [ws, client] of clients.entries()) {
-
-    if (
-      ws.readyState === WebSocket.OPEN &&
-      (target === "all" || client.role === target)
-    ) {
+    if (ws.readyState === WebSocket.OPEN && (target === "all" || client.role === target)) {
       ws.send(payload);
     }
   }
 }
 
 // ---------------- EXPO PUSH ----------------
+const pushTokens = new Set();
 
 async function sendExpoPush(type, requestId) {
-
   const messageMap = {
     water: ["Water Request 💧", "Patient needs water"],
     medicine: ["Medicine Request 💊", "Patient needs medicine"],
@@ -93,8 +67,6 @@ async function sendExpoPush(type, requestId) {
   };
 
   const [title, body] = messageMap[type];
-
-  // Tokens will be added by caregiver app
   const tokens = [...pushTokens];
 
   if (!tokens.length) return;
@@ -106,90 +78,103 @@ async function sendExpoPush(type, requestId) {
     channelId: "patient-alerts",
     title,
     body,
-    data: {
-      patientId: PATIENT_ID,
-      requestId,
-      type
-    }
+    data: { patientId: PATIENT_ID, requestId, type }
   }));
 
   try {
-
-    const response = await fetch(
-      "https://exp.host/--/api/v2/push/send",
-      {
-        method: "POST",
-
-        headers: {
-          "Content-Type": "application/json",
-          "Accept": "application/json"
-        },
-
-        body: JSON.stringify(messages)
-      }
-    );
-
-    if (!response.ok) {
-      throw new Error(`Expo error ${response.status}`);
-    }
-
+    const response = await fetch("https://exp.host/--/api/v2/push/send", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "Accept": "application/json" },
+      body: JSON.stringify(messages)
+    });
+    if (!response.ok) throw new Error(`Expo error ${response.status}`);
     console.log("Push result:", await response.json());
-
   } catch (error) {
     console.error("Push notification error:", error);
   }
 }
 
-const pushTokens = new Set();
-
 // ---------------- HEALTH CHECK ----------------
-
 app.get("/", (req, res) => {
-
-  res.json({
-    name: "HandSpeak API",
-    status: "running",
-    websocket: "enabled"
-  });
+  res.json({ name: "HandSpeak API", status: "running", websocket: "enabled" });
 });
 
-// ---------------- HTTP HISTORY ----------------
+// ---------------- ESP8266 HTTP ENDPOINT ----------------
+app.post("/api/esp-data", async (req, res) => {
+  const { token } = req.query;
+  
+  // Verify the device token
+  if (token !== DEVICE_TOKEN) {
+    return res.status(401).json({ error: "Unauthorized device" });
+  }
 
-app.get("/api/requests", async (req, res) => {
+  const data = req.body;
 
-  if (req.headers.authorization !==
-      `Bearer ${CAREGIVER_TOKEN}`) {
+  // Mark patient as online whenever data arrives
+  patientState.online = true;
+  patientState.lastSeen = new Date();
+  broadcast({ event: "device_status", online: true, lastSeen: patientState.lastSeen });
 
-    return res.status(401).json({
-      error: "Unauthorized"
+  // Handle Temperature updates
+  if (data.event === "temperature") {
+    patientState.temperature = data.value;
+    broadcast({
+      event: "temperature",
+      value: data.value,
+      timestamp: patientState.lastSeen
     });
   }
 
-  try {
+  // Handle Button Press requests
+  if (data.event === "request") {
+    const details = REQUESTS[data.type];
+    if (details) {
+      const record = await PatientRequest.create({
+        patientId: PATIENT_ID,
+        type: data.type,
+        message: details.message,
+        priority: details.priority,
+        temperature: data.temperature || null
+      });
 
+      broadcast({
+        event: "patient_request",
+        id: record._id.toString(),
+        type: record.type,
+        message: record.message,
+        priority: record.priority,
+        temperature: record.temperature,
+        acknowledged: false,
+        createdAt: record.createdAt
+      });
+
+      await sendExpoPush(record.type, record._id.toString());
+    }
+  }
+
+  res.json({ success: true });
+});
+
+// ---------------- HTTP HISTORY ----------------
+app.get("/api/requests", async (req, res) => {
+  if (req.headers.authorization !== `Bearer ${CAREGIVER_TOKEN}`) {
+    return res.status(401).json({ error: "Unauthorized" });
+  }
+
+  try {
     const requests = await PatientRequest
       .find({ patientId: PATIENT_ID })
       .sort({ createdAt: -1 })
       .limit(100);
-
     res.json(requests);
-
   } catch (error) {
-
-    res.status(500).json({
-      error: "Database error"
-    });
+    res.status(500).json({ error: "Database error" });
   }
 });
 
-// ---------------- WEBSOCKET UPGRADE ----------------
-
+// ---------------- WEBSOCKET UPGRADE (FOR EXPO APP) ----------------
 server.on("upgrade", (request, socket, head) => {
-
-  const url = new URL(
-    request.url,
-    `http://${request.headers.host}`
-  );
+  const url = new URL(request.url, `http://${request.headers.host}`);
 
   if (url.pathname !== "/ws") {
     socket.destroy();
@@ -199,45 +184,22 @@ server.on("upgrade", (request, socket, head) => {
   const role = url.searchParams.get("role");
   const token = url.searchParams.get("token");
 
-  const authorized =
-    (role === "device" && token === DEVICE_TOKEN) ||
-    (role === "caregiver" && token === CAREGIVER_TOKEN);
-
-  if (!authorized) {
+  // Only caregivers can connect via WebSocket
+  if (role !== "caregiver" || token !== CAREGIVER_TOKEN) {
     socket.write("HTTP/1.1 401 Unauthorized\r\n\r\n");
     socket.destroy();
     return;
   }
 
-  wss.handleUpgrade(
-    request,
-    socket,
-    head,
-    ws => {
-      wss.emit("connection", ws, role);
-    }
-  );
+  wss.handleUpgrade(request, socket, head, ws => {
+    wss.emit("connection", ws, role);
+  });
 });
 
 // ---------------- WEBSOCKET CONNECTION ----------------
-
 wss.on("connection", (ws, role) => {
-
   clients.set(ws, { role });
-
-  console.log(`${role} connected`);
-
-  if (role === "device") {
-
-    patientState.online = true;
-    patientState.lastSeen = new Date();
-
-    broadcast({
-      event: "device_status",
-      online: true,
-      lastSeen: patientState.lastSeen
-    });
-  }
+  console.log(`${role} connected via WebSocket`);
 
   ws.send(JSON.stringify({
     event: "connected",
@@ -245,202 +207,63 @@ wss.on("connection", (ws, role) => {
     patientId: PATIENT_ID
   }));
 
-  // Send current patient state to caregiver
-  if (role === "caregiver") {
-
-    ws.send(JSON.stringify({
-      event: "patient_state",
-      ...patientState
-    }));
-  }
+  // Send current patient state immediately
+  ws.send(JSON.stringify({
+    event: "patient_state",
+    ...patientState
+  }));
 
   ws.on("message", async raw => {
-
     try {
-
       const data = JSON.parse(raw.toString());
 
-      // -------- DEVICE MESSAGES --------
-
-      if (role === "device") {
-
-        if (data.event === "temperature") {
-
-          const temperature = Number(data.value);
-
-          if (
-            !Number.isFinite(temperature) ||
-            temperature < -20 ||
-            temperature > 100
-          ) return;
-
-          patientState.temperature = temperature;
-          patientState.lastSeen = new Date();
-
-          broadcast({
-            event: "temperature",
-            value: temperature,
-            timestamp: patientState.lastSeen
-          });
-
-        }
-
-        else if (data.event === "request") {
-
-          const details = REQUESTS[data.type];
-
-          if (!details) return;
-
-          const temperature = Number(data.temperature);
-
-          const record = await PatientRequest.create({
-
-            patientId: PATIENT_ID,
-
-            type: data.type,
-
-            message: details.message,
-
-            priority: details.priority,
-
-            temperature:
-              Number.isFinite(temperature)
-                ? temperature
-                : null
-
-          });
-
-          const response = {
-
-            event: "patient_request",
-
-            id: record._id.toString(),
-
-            type: record.type,
-
-            message: record.message,
-
-            priority: record.priority,
-
-            temperature: record.temperature,
-
-            acknowledged: false,
-
-            createdAt: record.createdAt
-
-          };
-
-          broadcast(response);
-
-          // Notify caregiver even if app is backgrounded
-          await sendExpoPush(
-            record.type,
-            record._id.toString()
-          );
-
-          ws.send(JSON.stringify({
-            event: "request_received",
-            id: record._id.toString()
-          }));
+      if (data.event === "register_push") {
+        if (typeof data.token === "string" && /^ExponentPushToken\[.+\]$/.test(data.token)) {
+          pushTokens.add(data.token);
+          console.log("Registered push token");
         }
       }
 
-      // -------- CAREGIVER MESSAGES --------
+      else if (data.event === "acknowledge") {
+        const record = await PatientRequest.findOneAndUpdate(
+          { _id: data.id, patientId: PATIENT_ID },
+          { acknowledged: true, acknowledgedAt: new Date() },
+          { new: true }
+        );
 
-      if (role === "caregiver") {
-
-        if (data.event === "register_push") {
-
-          if (
-            typeof data.token === "string" &&
-            /^ExponentPushToken\[.+\]$/.test(data.token)
-          ) {
-            pushTokens.add(data.token);
-          }
-        }
-
-        else if (data.event === "acknowledge") {
-
-          const record = await PatientRequest.findOneAndUpdate(
-            {
-              _id: data.id,
-              patientId: PATIENT_ID
-            },
-
-            {
-              acknowledged: true,
-              acknowledgedAt: new Date()
-            },
-
-            { new: true }
-          );
-
-          if (record) {
-
-            broadcast({
-              event: "request_acknowledged",
-              id: record._id.toString(),
-              acknowledged: true,
-              acknowledgedAt: record.acknowledgedAt
-            }, "all");
-          }
+        if (record) {
+          broadcast({
+            event: "request_acknowledged",
+            id: record._id.toString(),
+            acknowledged: true,
+            acknowledgedAt: record.acknowledgedAt
+          }, "all");
         }
       }
 
     } catch (error) {
-
       console.error("WebSocket message error:", error);
-
       if (ws.readyState === WebSocket.OPEN) {
-        ws.send(JSON.stringify({
-          event: "error",
-          message: "Invalid message"
-        }));
+        ws.send(JSON.stringify({ event: "error", message: "Invalid message" }));
       }
     }
   });
 
   ws.on("close", () => {
-
     clients.delete(ws);
-
     console.log(`${role} disconnected`);
-
-    if (role === "device") {
-
-      const anotherDevice = [...clients.values()]
-        .some(client => client.role === "device");
-
-      if (!anotherDevice) {
-
-        patientState.online = false;
-
-        broadcast({
-          event: "device_status",
-          online: false
-        });
-      }
-    }
   });
 });
 
 // ---------------- DATABASE + SERVER ----------------
-
 mongoose.connect(process.env.MONGO_URI)
   .then(() => {
-
     console.log("MongoDB connected");
-
     server.listen(PORT, "0.0.0.0", () => {
-
       console.log(`HandSpeak running on port ${PORT}`);
-
     });
-
   })
   .catch(error => {
-
     console.error("MongoDB connection failed:", error);
-
     process.exit(1);
   });
