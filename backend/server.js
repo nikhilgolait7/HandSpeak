@@ -16,9 +16,7 @@ app.use(express.json());
 const server = http.createServer(app);
 
 // WebSocket server (for the Caregiver Expo App)
-const wss = new WebSocket.Server({
-  noServer: true
-});
+const wss = new WebSocket.Server({ noServer: true });
 
 const PORT = process.env.PORT || 3000;
 
@@ -29,10 +27,10 @@ const PATIENT_ID = process.env.PATIENT_ID || "patient-001";
 // Connected caregiver clients
 const clients = new Map();
 
-// Patient state
+// Patient state (Updated to Heart Rate)
 const patientState = {
   online: false,
-  temperature: null,
+  heartRate: null,
   lastSeen: null
 };
 
@@ -43,6 +41,22 @@ const REQUESTS = {
   help: { message: "Patient needs help", priority: "high" },
   emergency: { message: "Patient requires emergency assistance", priority: "critical" }
 };
+
+// ================= NEW: PATIENT DATABASE MODEL =================
+const PatientSchema = new mongoose.Schema({
+  patientId: { type: String, required: true, unique: true },
+  name: { type: String, required: true },
+  mobile: { type: String, required: true },
+  relatives: [{
+    name: String,
+    mobile: String,
+  }],
+  doctor: {
+    name: String,
+    mobile: String,
+  }
+});
+const Patient = mongoose.model("Patient", PatientSchema);
 
 // ---------------- BROADCAST TO CAREGIVER APP ----------------
 function broadcast(data, target = "caregiver") {
@@ -99,27 +113,72 @@ app.get("/", (req, res) => {
   res.json({ name: "HandSpeak API", status: "running", websocket: "enabled" });
 });
 
-// ---------------- ESP8266 HTTP ENDPOINT ----------------
+// ================= NEW: PATIENT ADMIN ROUTES =================
+
+// 1. Register or Update a Patient
+app.post("/api/patients", async (req, res) => {
+  try {
+    const { patientId, name, mobile, relatives, doctor } = req.body;
+    
+    // Upsert (Update if exists, insert if new)
+    const patient = await Patient.findOneAndUpdate(
+      { patientId },
+      { name, mobile, relatives, doctor },
+      { new: true, upsert: true }
+    );
+    res.json({ success: true, patient });
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ error: "Failed to save patient" });
+  }
+});
+
+// 2. Get Patient Data (Protected by Caregiver Token)
+app.get("/api/patients/:id", async (req, res) => {
+  if (req.headers.authorization !== `Bearer ${CAREGIVER_TOKEN}`) {
+    return res.status(401).json({ error: "Unauthorized" });
+  }
+  try {
+    const patient = await Patient.findOne({ patientId: req.params.id });
+    res.json(patient || {});
+  } catch (error) {
+    res.status(500).json({ error: "Database error" });
+  }
+});
+
+// 3. Clear Database (Danger Zone)
+app.delete("/api/clear-db", async (req, res) => {
+  if (req.headers.authorization !== `Bearer ${CAREGIVER_TOKEN}`) {
+    return res.status(401).json({ error: "Unauthorized" });
+  }
+  try {
+    await Patient.deleteMany({});
+    await PatientRequest.deleteMany({});
+    res.json({ success: true, message: "Database cleared" });
+  } catch (error) {
+    res.status(500).json({ error: "Failed to clear database" });
+  }
+});
+
+// ================= ESP8266 HTTP ENDPOINT =================
 app.post("/api/esp-data", async (req, res) => {
   const { token } = req.query;
   
-  // Verify the device token
   if (token !== DEVICE_TOKEN) {
     return res.status(401).json({ error: "Unauthorized device" });
   }
 
   const data = req.body;
 
-  // Mark patient as online whenever data arrives
   patientState.online = true;
   patientState.lastSeen = new Date();
   broadcast({ event: "device_status", online: true, lastSeen: patientState.lastSeen });
 
-  // Handle Temperature updates
-  if (data.event === "temperature") {
-    patientState.temperature = data.value;
+  // Handle Heart Rate updates
+  if (data.event === "heart_rate") {
+    patientState.heartRate = data.value;
     broadcast({
-      event: "temperature",
+      event: "heart_rate",
       value: data.value,
       timestamp: patientState.lastSeen
     });
@@ -134,7 +193,7 @@ app.post("/api/esp-data", async (req, res) => {
         type: data.type,
         message: details.message,
         priority: details.priority,
-        temperature: data.temperature || null
+        heartRate: data.heart_rate || null // Save HR instead of temp
       });
 
       broadcast({
@@ -143,7 +202,7 @@ app.post("/api/esp-data", async (req, res) => {
         type: record.type,
         message: record.message,
         priority: record.priority,
-        temperature: record.temperature,
+        heartRate: record.heartRate,
         acknowledged: false,
         createdAt: record.createdAt
       });
@@ -184,7 +243,6 @@ server.on("upgrade", (request, socket, head) => {
   const role = url.searchParams.get("role");
   const token = url.searchParams.get("token");
 
-  // Only caregivers can connect via WebSocket
   if (role !== "caregiver" || token !== CAREGIVER_TOKEN) {
     socket.write("HTTP/1.1 401 Unauthorized\r\n\r\n");
     socket.destroy();
@@ -201,17 +259,8 @@ wss.on("connection", (ws, role) => {
   clients.set(ws, { role });
   console.log(`${role} connected via WebSocket`);
 
-  ws.send(JSON.stringify({
-    event: "connected",
-    role,
-    patientId: PATIENT_ID
-  }));
-
-  // Send current patient state immediately
-  ws.send(JSON.stringify({
-    event: "patient_state",
-    ...patientState
-  }));
+  ws.send(JSON.stringify({ event: "connected", role, patientId: PATIENT_ID }));
+  ws.send(JSON.stringify({ event: "patient_state", ...patientState }));
 
   ws.on("message", async raw => {
     try {
